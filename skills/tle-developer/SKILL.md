@@ -1,6 +1,17 @@
 ---
 name: tle-developer
-description: Self-contained orchestration skill for writing high-performance TLE kernels and shipping TLE feature changes with reproducible validation.
+description: >
+  Self-contained orchestration skill for writing high-performance TLE kernels
+  and shipping TLE feature changes with reproducible validation. Use when the
+  user wants to write/optimize TLE kernels, implement TLE API/verifier/lowering
+  features, or debug TLE correctness/performance issues. Trigger on phrases like
+  "write a TLE kernel", "optimize TLE operator", and "debug TLE local_ptr".
+user-invokable: true
+argument-hint: |
+  Goal: <what to build or fix>
+  Non-goal: <what is explicitly out of scope>
+  Acceptance: <observable success criteria>
+  Impact scope (optional): <affected files/modules/components>
 ---
 
 # TLE Developer
