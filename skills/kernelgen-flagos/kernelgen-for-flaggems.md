@@ -1,28 +1,3 @@
----
-name: kernelgen-for-flaggems
-description: >
-  Generate a FlagGems operator via kernelgen-mcp. Checks environment & MCP availability, calls the
-  code generator, places files in the correct FlagGems project locations, and runs accuracy +
-  benchmark tests. Use this skill when working in a FlagGems repository and need to generate GPU
-  kernel operators. Trigger when the user says things like "generate a FlagGems operator", "create
-  a kernel for FlagGems", or "/kernelgen-for-flaggems".
-argument-hint: "<operator_name> [--func-type <type>]"
-user-invokable: true
-compatibility: "Python 3.8+, FlagGems, PyTorch with CUDA, Triton"
-metadata:
-  version: "1.0.0"
-  author: flagos-ai
-  category: gpu-kernel-generation
-  tags: [kernelgen, flaggems, triton, gpu, mcp, operator-generation]
-allowed-tools:
-  - Bash
-  - Read
-  - Write
-  - Edit
-  - Glob
-  - Grep
-  - AskUserQuestion
----
 
 # KernelGen Skill — Generate FlagGems Operators via MCP
 
@@ -36,12 +11,99 @@ You are an expert at generating GPU kernel operators for the FlagGems project us
 - **Glob**: find files by pattern
 - **MCP tools**: `mcp__kernelgen-mcp__generate_operator` and `mcp__kernelgen-mcp__optimize_triton`
 
-> **⚠️ MCP Prerequisite Check**: If the user has not configured the kernelgen MCP service (i.e., MCP tools are unavailable or calls fail),
+> **MCP Prerequisite Check**: If the user has not configured the kernelgen MCP service (i.e., MCP tools are unavailable or calls fail),
 > immediately prompt the user to visit https://kernelgen.flagos.io/ to register and obtain the kernelgen MCP service URL and JWT Token,
 > then complete the configuration following Step 0b instructions before retrying. Do not proceed with subsequent steps if MCP is not ready.
 
 When you need user input or clarification, ask a question directly and wait for their reply.
 Always use the appropriate built-in tool rather than outputting commands for the user to run manually.
+
+## Execution Rules
+
+1. **Follow the steps in order**. Never jump ahead.
+2. **Never skip Step 2** (operator existence check) — always verify before generating.
+3. **Do not generate or write any code before Step 4** (MCP call). Steps 0–3 are preparation only.
+4. **Always confirm with the user before destructive actions**.
+5. **Report progress to the user when entering each step**.
+6. **Never fabricate repository files or paths**.
+7. **CRITICAL — MCP is mandatory**: ALL operator code generation MUST go through the
+   `mcp__kernelgen-mcp__generate_operator` MCP tool. NEVER generate Triton kernels, PyTorch
+   wrappers, or operator implementations yourself — even if the operator seems simple (e.g.,
+   relu, abs). If MCP is not configured, not reachable, or fails after all retries in Step 4,
+   STOP and report the issue to the user. Do NOT fall back to writing kernel code manually.
+   The MCP service produces optimized, tested code that manual writing cannot match.
+
+---
+
+## FlagGems Project Layout Reference
+
+The FlagGems project has three operator locations and corresponding test/benchmark locations:
+
+### Operator Locations
+| Location | Path | Description |
+|---|---|---|
+| **Core (src)** | `src/flag_gems/ops/<kernel_name>.py` | Mature, production-quality operators. Uses `pointwise_dynamic` decorators for pointwise ops. Registered in `_FULL_CONFIG` for aten dispatch. |
+| **Experimental** | `src/flag_gems/experimental_ops/<kernel_name>.py` | New/experimental operators. Uses raw Triton pointer-based style (self-contained, no `pointwise_dynamic`). NOT registered in `_FULL_CONFIG`. |
+| **Backend** | `src/flag_gems/runtime/backend/_<vendor>/ops/<kernel_name>.py` | Non-NVIDIA chip-specific operators. Vendor names: `_ascend` (Huawei), `_cambricon`, `_hygon` (DCU), `_mthreads` (Moore), `_iluvatar` (Tianshu), `_metax`, `_amd`, `_kunlunxin`, `_arm`, `_aipu`. |
+
+### Test Locations
+| Operator Location | Accuracy Tests | Performance Tests |
+|---|---|---|
+| **Core (src)** | `tests/test_<category>_ops.py` (append to existing file) | `benchmark/test_<category>_perf.py` (append to existing file) |
+| **Experimental** | `experimental_tests/<kernel_name>_test.py` (standalone file) | Same file as accuracy test (includes benchmark function) |
+| **Backend** | Backend-specific test directory (follow existing pattern per vendor) | Backend-specific benchmark directory |
+
+### Test Style Conventions (CRITICAL)
+
+**`tests/` folder style** — uses `flag_gems.use_gems()` context manager and calls ops via `torch.<op>()`:
+```python
+import flag_gems
+from .accuracy_utils import gems_assert_close, to_reference, POINTWISE_SHAPES, FLOAT_DTYPES
+
+def test_accuracy_<kernel_name>(shape, dtype):
+    inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    ref_inp = to_reference(inp)
+    ref_out = <torch_call>(ref_inp)
+    with flag_gems.use_gems():
+        res_out = torch.<kernel_name>(inp)
+    gems_assert_close(res_out, ref_out, dtype)
+```
+
+**`experimental_tests/` folder style** — uses direct import from `flag_gems.experimental_ops`:
+```python
+import flag_gems
+from flag_gems.experimental_ops.<kernel_name> import <kernel_name> as gems_op
+
+def test_<kernel_name>_tensor(shape, dtype):
+    x = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    ref_x = to_reference(x)
+    ref_out = torch.ops.aten.<kernel_name>(ref_x)
+    with flag_gems.use_gems():
+        act_out = gems_op(x)
+    gems_assert_close(act_out, ref_out, dtype=dtype)
+```
+
+**IMPORTANT**: Before writing a test, always read 1-2 existing test files in the **same folder** to match the exact style (imports, utility functions, assertion helpers, parametrize decorators, etc.). Never mix styles between folders.
+
+### Decorator Conventions
+
+**Core ops (`src/flag_gems/ops/`)** use FlagGems decorators:
+- `@pointwise_dynamic(promotion_methods=...)` + `@triton.jit` — for pointwise ops
+- The kernel receives **scalar elements** (not pointers), no `tl.load`/`tl.store`
+- See `src/flag_gems/ops/abs.py`, `src/flag_gems/ops/sigmoid.py` for examples
+
+**Experimental ops (`src/flag_gems/experimental_ops/`)** use raw Triton style:
+- `@triton.jit` only — standard Triton pointer-based kernels
+- The kernel receives **pointers**, uses `tl.load`/`tl.store`, `BLOCK_SIZE`, masks
+- Self-contained, no `flag_gems.utils` imports needed
+- See `src/flag_gems/experimental_ops/abs.py` for example
+
+**When adapting MCP output**: The MCP always generates raw pointer-based Triton code.
+- For **core ops**: MUST rewrite to `pointwise_dynamic` style — strip all pointer logic
+- For **experimental ops**: Keep the MCP Triton code mostly as-is (it's already pointer-based)
+- For **backend ops**: Follow the existing backend vendor patterns
+
+---
 
 ## Step 0: Pre-flight — Environment & MCP Check
 
@@ -161,6 +223,13 @@ Parse the user's description to determine:
   - `blas` — matrix operations (matmul, mm, bmm, etc.)
   - `other` — everything else (indexing, special, etc.)
 - `arg_names`, `arg_type`, `arg_descs`, `output_arg_desc`: parameter information
+- `target_device`: determine target device from user context:
+  - If user mentions NVIDIA/英伟达/nv or doesn't specify → `"nvidia"` (default)
+  - If user mentions 华为/昇腾/Ascend → `"huawei"`
+  - If user mentions 海光/Hygon/DCU → `"haiguang"`
+  - If user mentions 摩尔/Moore/摩尔线程 → `"moore"`
+  - If user mentions 天数/Tianshu/天数智芯 → `"tianshu"`
+  - If user mentions 寒武纪/Cambricon → `"cambricon"`
 
 If the operator name is ambiguous, first check this common alias table before asking the user:
 
@@ -202,8 +271,36 @@ After determining `func_type`, derive the `<category>` value used for test/bench
 | `blas` | `blas` |
 | `other` | `special` |
 
-Store this `<category>` value — it determines which `tests/test_<category>_ops.py` and
-`benchmark/test_<category>_perf.py` files to modify.
+Store this `<category>` value — it determines which test and benchmark files to modify.
+
+## Step 1.5: Determine Placement (NEW — CRITICAL DECISION)
+
+Based on the user's request and the operator analysis, determine `<placement>`:
+
+### Decision Rules
+
+1. **Backend placement** (`backend`): If `target_device` is NOT `"nvidia"` (i.e., non-NVIDIA chip), the operator goes into the backend directory:
+   - Operator: `src/flag_gems/runtime/backend/_<vendor>/ops/<kernel_name>.py`
+   - Tests: Follow the existing backend vendor test pattern (read existing tests in that vendor's directory first)
+
+2. **Core placement** (`core`): If the user explicitly asks to **modify/replace an existing core operator** in `src/flag_gems/ops/`, or the user specifically says "add to src/core":
+   - Operator: `src/flag_gems/ops/<kernel_name>.py`
+   - Tests: `tests/test_<category>_ops.py` (append to existing file)
+   - Benchmarks: `benchmark/test_<category>_perf.py` (append to existing file)
+
+3. **Experimental placement** (`experimental`) — **DEFAULT for new operators**:
+   - New operators should go here unless the user explicitly requests core placement
+   - Operator: `src/flag_gems/experimental_ops/<kernel_name>.py`
+   - Tests: `experimental_tests/<kernel_name>_test.py` (standalone file)
+   - Benchmarks: Included in the same test file
+
+### Ask the user if ambiguous
+
+If the placement is not obvious from context, ask:
+- "This is a new operator. I recommend placing it in `experimental_ops/` (experimental). Would you prefer to place it in `src/flag_gems/ops/` (core) instead?"
+- If the user mentions a non-NVIDIA chip, confirm: "I'll place this in the `_<vendor>` backend directory. Is that correct?"
+
+Store `<placement>` as one of: `core`, `experimental`, `backend`.
 
 ## Step 2: Check Whether the Operator Already Exists
 
@@ -211,10 +308,11 @@ Before calling the MCP generator, **thoroughly search** the codebase for existin
 
 1. **Core ops**: Use the Glob tool to check for `src/flag_gems/ops/<kernel_name>.py`
 2. **Experimental ops**: Use the Glob tool to check for `src/flag_gems/experimental_ops/<kernel_name>.py`
-3. **Registration**: Use the Grep tool to search `src/flag_gems/ops/__init__.py` and `src/flag_gems/__init__.py` for the op name
-4. **Aten registration**: Use the Grep tool to search for `torch.ops.aten.<kernel_name>` in the codebase (some registrations use the aten op reference instead of string names)
-5. **Tests**: Use the Grep tool to search `tests/test_*_ops.py` for `test_accuracy_<kernel_name>`
-6. **Benchmarks**: Use the Grep tool to search `benchmark/test_*_perf.py` for the op name in `forward_operations`
+3. **Backend ops**: If `<placement>` is `backend`, check `src/flag_gems/runtime/backend/_<vendor>/ops/<kernel_name>.py`
+4. **Registration**: Use the Grep tool to search `src/flag_gems/ops/__init__.py` and `src/flag_gems/__init__.py` for the op name
+5. **Aten registration**: Use the Grep tool to search for `torch.ops.aten.<kernel_name>` in the codebase (some registrations use the aten op reference instead of string names)
+6. **Tests**: Use the Grep tool to search `tests/test_*_ops.py` and `experimental_tests/<kernel_name>_test.py` for the op name
+7. **Benchmarks**: Use the Grep tool to search `benchmark/test_*_perf.py` for the op name in `forward_operations`
 
 ### If the operator already exists
 
@@ -223,46 +321,55 @@ Present findings to the user and ask them to choose one of the following:
 **Option A — Skip generation**: The operator already exists; do nothing.
 
 **Option B — Replace existing**: Overwrite the current implementation with MCP-generated code
-(adapted to FlagGems conventions). This will modify:
-  - `src/flag_gems/ops/<kernel_name>.py`
-  - Potentially update tests and benchmarks
+(adapted to FlagGems conventions). The file stays in its **current location** (core stays in core, experimental stays in experimental).
 
-**Option C — Create a custom variant (side-by-side)**: Generate the operator under a different
-name so it coexists with the original. The naming convention is `<kernel_name>_v2` (or a
-user-specified suffix). This will:
-  - Create `src/flag_gems/ops/<kernel_name>_v2.py`
-  - Add a new import + `__all__` entry in `src/flag_gems/ops/__init__.py`
+**Option C — Create experimental variant (side-by-side)**: Generate the operator under the same
+name in `experimental_ops/` so it coexists with the original. This will:
+  - Create `src/flag_gems/experimental_ops/<kernel_name>.py`
+  - Create a standalone test in `experimental_tests/<kernel_name>_test.py`
+  - Include a perf benchmark in that same test file
   - Do **NOT** register it in `_FULL_CONFIG` (it won't override the aten dispatch)
-  - Create a standalone test in `experimental_tests/<kernel_name>_v2_test.py`
-  - Include a perf benchmark in that same test file using `GenericBenchmark`
 
 Only proceed to Step 3 after the user has made a choice.
 
 ### If the operator does NOT exist
 
-Proceed directly to Step 3.
+Proceed directly to Step 3. Use `<placement>` determined in Step 1.5.
 
 ## Step 3: Research Context (flagos_wiki)
 
 Before calling the MCP generator, use the Read tool to gather reference materials that improve generation quality:
 
-1. **Read similar operator code** from the codebase. For example:
-   - Unary pointwise → read `src/flag_gems/ops/abs.py` or `src/flag_gems/ops/sigmoid.py`
-   - Binary pointwise → read `src/flag_gems/ops/add.py`
-   - Reduction → read `src/flag_gems/ops/sum.py` or `src/flag_gems/ops/mean.py`
-   - Normalization → read `src/flag_gems/ops/layer_norm.py`
-   - BLAS → read `src/flag_gems/ops/mm.py`
+1. **Read similar operator code** from the codebase. Choose based on `<placement>`:
+   - **Core placement** — read from `src/flag_gems/ops/`:
+     - Unary pointwise → read `src/flag_gems/ops/abs.py` or `src/flag_gems/ops/sigmoid.py`
+     - Binary pointwise → read `src/flag_gems/ops/add.py`
+     - Reduction → read `src/flag_gems/ops/sum.py` or `src/flag_gems/ops/mean.py`
+     - Normalization → read `src/flag_gems/ops/layer_norm.py`
+     - BLAS → read `src/flag_gems/ops/mm.py`
+   - **Experimental placement** — read from `src/flag_gems/experimental_ops/`:
+     - Read `src/flag_gems/experimental_ops/abs.py` or a similar experimental op
+   - **Backend placement** — read existing ops in the target vendor directory
 
-2. **Read the test pattern** from the matching test file to understand shapes, dtypes, assertions.
+2. **Read the test pattern** from the matching test location:
+   - **Core**: read `tests/test_<category>_ops.py` — note the import style, utility functions, parametrize patterns
+   - **Experimental**: read an existing `experimental_tests/<some_op>_test.py` — note the direct import style, `to_reference()`, `GenericBenchmark` usage
+   - **Backend**: read existing tests in the backend vendor directory
 
-3. **If replacing an existing op** (Option B), read the current implementation so the new version
+3. **Note the decorators used** in similar operators:
+   - Core pointwise ops use `@pointwise_dynamic(promotion_methods=...)` + `@triton.jit`
+   - Experimental ops use `@triton.jit` only (raw pointer-based)
+   - Some ops may use other decorators like `@triton.autotune` — note these
+
+4. **If replacing an existing op** (Option B), read the current implementation so the new version
    can be compared / improved upon.
 
-4. Collect all findings and **summarize into concise notes** (not full file contents) to pass as
+5. Collect all findings and **summarize into concise notes** (not full file contents) to pass as
    the `flagos_wiki` parameter. For example:
    - `"abs.py uses pointwise_dynamic with DEFAULT promotion, returns tl.abs(x)"`
    - `"sigmoid.py uses INT_TO_FLOAT promotion, returns 1/(1+tl.exp(-x))"`
    - `"test pattern: @pytest.mark.xxx, POINTWISE_SHAPES, FLOAT_DTYPES, gems_assert_close"`
+   - `"experimental test style: from flag_gems.experimental_ops.abs import abs as gems_abs, uses torch.ops.aten.abs for reference"`
 
    If the `mcp__kernelgen-mcp__generate_operator` tool supports a `flagos_wiki` (or similarly named
    `context`/`references`) parameter, pass the collected notes. If the MCP call fails with an
@@ -274,6 +381,9 @@ Before calling the MCP generator, use the Read tool to gather reference material
 Invoke `mcp__kernelgen-mcp__generate_operator` with the parameters gathered above, including the
 `flagos_wiki` list for reference context.
 
+If `<placement>` is `backend` and target device is not nvidia, pass the `device` parameter to the
+MCP call (e.g., `device="huawei"` for Ascend).
+
 **Set the iteration counter**: `iteration_count = 1`. This tracks total MCP calls for the final report.
 
 The MCP returns four code blocks:
@@ -282,10 +392,52 @@ The MCP returns four code blocks:
 - `test_func_code` — accuracy test code
 - `benchmark_func_code` — performance benchmark code
 
+## Step 4.5: MCP Report Review
+
+If the MCP response includes test results (accuracy test reports, benchmark/speedup reports),
+present them to the user **in full** before proceeding to local code adaptation:
+
+```
+=== MCP Generation Test Report ===
+
+Accuracy Test Results:
+<paste the COMPLETE accuracy test output from the MCP response — do not summarize or truncate>
+
+Performance Benchmark Results:
+<paste the COMPLETE benchmark/speedup output from the MCP response — do not summarize or truncate>
+```
+
+Then ask the user:
+
+> The MCP service has returned the above test reports from its generation environment.
+> Would you like to:
+>
+> **A — Skip local testing**: Trust the MCP reports and proceed directly to code placement
+> and summary. No local tests will be run.
+>
+> **B — Run local tests**: Run accuracy and performance tests on your local machine as well
+> to verify the results in your specific environment.
+
+Wait for the user's choice before proceeding:
+- If **A (skip local testing)**: After placing code in Step 5, skip Steps 6 and 7 (local
+  accuracy tests and benchmarks) and proceed directly to Step 8 (Summary). Use the MCP
+  report numbers for the summary.
+- If **B (run local tests)**: Proceed normally through Steps 5 → 6 → 7 → 8. Before
+  running local tests, perform the **Chip Compatibility Check** described in Step 5.5c.
+
+**If the MCP response does NOT include test reports** (only code blocks), proceed normally
+to Step 5 — local testing will be required.
+
 ## Step 5: Adapt and Place Code into the FlagGems Project
 
 This is the most critical step. The generated code must be transformed to match FlagGems conventions.
-The exact placement depends on the user's choice in Step 2.
+The exact placement and transformation depends on `<placement>`.
+
+---
+
+### Placement: Core (`src/flag_gems/ops/`)
+
+#### 5a. Operator Implementation → `src/flag_gems/ops/<kernel_name>.py`
 
 **Transformation rules for pointwise ops**: The MCP generator will almost always output raw
 pointer-based Triton code. For core pointwise ops, you MUST **always** rewrite it into the
@@ -311,14 +463,7 @@ Do NOT keep `offsets`, `mask`, `n_elements`, `BLOCK_SIZE`, or any tiling logic.
 following FlagGems `pointwise_dynamic` conventions. Never trust the raw MCP code — it will
 almost always be pointer-style which is incompatible with `pointwise_dynamic`.
 
----
-
-### Path 1: New operator / Replace existing (Option B or new op)
-
-#### 5a. Operator Implementation → `src/flag_gems/ops/<kernel_name>.py`
-
-Use the Write tool (new file) or Edit tool (replacing existing) to create the operator file
-following FlagGems conventions:
+Use the Write tool (new file) or Edit tool (replacing existing) to create the operator file.
 
 **Unary pointwise template:**
 ```python
@@ -371,16 +516,9 @@ normalization), do NOT use either template — instead read a similar existing o
 its pattern.
 
 **For in-place variants**: Read an existing in-place operator (e.g., `relu.py`) to find the
-exact call pattern used in this repo, then follow it. Common patterns include:
-
-```python
-def <kernel_name>_(A):
-    logger.debug("GEMS <KERNEL_NAME>_ FORWARD")
-    return <kernel_name>_forward(A, out0=A)
-```
-
-Do NOT assume the in-place parameter name — it may be `out0=A`, `out=A`, or another convention.
-Always verify by reading an existing in-place operator first.
+exact call pattern used in this repo, then follow it. Do NOT assume the in-place parameter
+name — it may be `out0=A`, `out=A`, or another convention. Always verify by reading an existing
+in-place operator first.
 
 Key conventions:
 - Use `pointwise_dynamic` decorator from `flag_gems.utils` for pointwise ops
@@ -397,10 +535,8 @@ Key conventions:
     - Unary ops: `[(0, "DEFAULT")]` or `[(0, "INT_TO_FLOAT")]`
     - Binary ops: `[(0, "DEFAULT"), (1, "DEFAULT")]` or `[(0, "INT_TO_FLOAT"), (1, "INT_TO_FLOAT")]`
   - **When in doubt, prefer reading the repo** — promotion behavior is subtle and repo-specific.
-    Promotion rules in FlagGems are repo-specific and must never be guessed if a similar operator exists.
 - The wrapper function takes `A` as the input tensor parameter name (NOT `self`)
 - Include `logger.debug("GEMS <NAME> FORWARD")` in the wrapper
-- For in-place variants, read an existing in-place op first and copy its exact call pattern
 - For non-pointwise ops (reduction, BLAS, normalization, etc.), follow the specific pattern of similar existing ops — do NOT force the `pointwise_dynamic` pattern on them
 
 #### 5b. Register the Operator
@@ -430,6 +566,14 @@ Do NOT create a new test file. Use the Edit tool to add the test function to the
 - Norm: `tests/test_norm_ops.py`
 - Special: `tests/test_special_ops.py`
 
+**IMPORTANT — Match existing style**: Before writing the test, **read at least 2 existing test
+functions** in the target file. Ensure you match:
+- Import style (from `.accuracy_utils import ...`)
+- The `flag_gems.use_gems()` context manager pattern
+- Assertion function (`gems_assert_close` or `gems_assert_equal`)
+- `to_reference()` usage pattern
+- Parametrize decorators (`POINTWISE_SHAPES`, `FLOAT_DTYPES`, etc.)
+
 Follow the existing test pattern:
 ```python
 @pytest.mark.<kernel_name>
@@ -453,12 +597,7 @@ Key conventions:
 - Use `gems_assert_close` or `gems_assert_equal` for comparison
 - Mark with `@pytest.mark.<kernel_name>`
 - If the marker `<kernel_name>` is not already registered, find where markers are defined
-  (check in this order):
-  1. `pytest.ini` — look for `[pytest] markers`
-  2. `pyproject.toml` — look for `[tool.pytest.ini_options] markers`
-  3. `setup.cfg` — look for `[tool:pytest] markers`
-  Add the marker to whichever file already has a markers section.
-  If none of them has a markers section, create one in `pytest.ini`.
+  (check `pytest.ini`, `pyproject.toml`, or `setup.cfg`) and add it.
 - Use `POINTWISE_SHAPES`, `FLOAT_DTYPES` etc. from `accuracy_utils`
 
 #### 5d. Performance Benchmark → `benchmark/test_<category>_perf.py`
@@ -466,92 +605,72 @@ Key conventions:
 Do NOT create a new benchmark file. Read the target benchmark file first, then use the Edit tool
 to append the new tuple into the existing `forward_operations` list (find the list definition and
 insert in alphabetical order). Follow the exact tuple format already used in the file.
-- Unary pointwise: `benchmark/test_unary_pointwise_perf.py`
-- Binary pointwise: `benchmark/test_binary_pointwise_perf.py`
-- Reduction: `benchmark/test_reduction_perf.py`
-- Norm: `benchmark/test_norm_perf.py`
-- BLAS: `benchmark/test_blas_perf.py`
-- Special: `benchmark/test_special_perf.py`
-
-For unary pointwise ops, simply add a tuple to `forward_operations`:
-```python
-("<kernel_name>", <torch_call>, FLOAT_DTYPES),
-```
-
-For inplace ops, **only** add to `forward_inplace_operations` if PyTorch provides an inplace version.
-Verify by running `hasattr(torch, "<kernel_name>_")` or checking if `torch.<kernel_name>_` exists
-(e.g., `torch.relu_` exists, but `torch.gelu_` and `torch.softmax_` do not).
-If the inplace op requires extra mandatory arguments (e.g., `clamp_` needs `min`/`max`), verify
-the signature via `import inspect; inspect.signature(torch.<kernel_name>_)` before adding it.
-**Important**: Always use `torch.<kernel_name>_` for the inplace reference — do NOT derive from
-`<torch_call>` (e.g., `torch.nn.functional.relu_` does not exist):
-```python
-("<kernel_name>_", torch.<kernel_name>_, FLOAT_DTYPES),
-```
 
 ---
 
-### Path 2: Custom variant side-by-side (Option C)
+### Placement: Experimental (`src/flag_gems/experimental_ops/`)
 
-#### 5a. Operator Implementation → `src/flag_gems/ops/<kernel_name>_v2.py`
+This is the **default for new operators**.
 
-Use the Write tool to create the file. Use the **raw Triton pointer-based style** (same as
-`experimental_ops/`), since this operator does NOT go through `pointwise_dynamic` dispatch.
+#### 5a. Operator Implementation → `src/flag_gems/experimental_ops/<kernel_name>.py`
+
+Use the Write tool to create the file. Use the **raw Triton pointer-based style** (standard for experimental ops).
 Keep the MCP-generated Triton code mostly as-is but ensure it:
-- Is self-contained (no flag_gems.utils imports needed)
+- Is self-contained (no `flag_gems.utils` imports needed, no `pointwise_dynamic`)
 - Has proper `@triton.jit` kernel with pointer args, mask, BLOCK_SIZE
-- **Has a Python wrapper function** that computes the grid and launches the kernel.
-  **Ensure all kernel meta parameters (BLOCK_SIZE, etc.) are passed** — either via
-  `@triton.autotune` (which sets them automatically) or as explicit keyword arguments:
-  ```python
-  # Option A: with @triton.autotune on the kernel (BLOCK_SIZE auto-set)
-  def <kernel_name>_v2(x: torch.Tensor) -> torch.Tensor:
-      assert x.is_cuda, "Triton kernel requires CUDA tensor"
-      assert x.is_contiguous(), "Input tensor must be contiguous"
-      output = torch.empty_like(x)
-      n_elements = x.numel()
-      grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-      _<kernel_name>_v2_kernel[grid](x, output, n_elements)
-      return output
+- **Has a Python wrapper function** that computes the grid and launches the kernel
+- Exports the wrapper function named `<kernel_name>` (and optionally `<kernel_name>_out`)
 
-  # Option B: without autotune (adaptive BLOCK_SIZE heuristic)
-  def <kernel_name>_v2(x: torch.Tensor) -> torch.Tensor:
-      assert x.is_cuda, "Triton kernel requires CUDA tensor"
-      assert x.is_contiguous(), "Input tensor must be contiguous"
-      output = torch.empty_like(x)
-      n_elements = x.numel()
-      if n_elements < 4096:
-          BLOCK_SIZE = 256
-      elif n_elements < 65536:
-          BLOCK_SIZE = 512
-      else:
-          BLOCK_SIZE = 1024
-      grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-      _<kernel_name>_v2_kernel[grid](x, output, n_elements, BLOCK_SIZE=BLOCK_SIZE)
-      return output
-  ```
-  Adapt the grid computation to match the kernel pattern (elementwise vs row-wise).
-- Exports the wrapper function named `<kernel_name>_v2`
+**Ensure all kernel meta parameters (BLOCK_SIZE, etc.) are passed** — either via
+`@triton.autotune` or as explicit keyword arguments.
 
-Alternatively, if the user prefers the `pointwise_dynamic` style, use that and just rename
-the function to `<kernel_name>_v2`.
+Example structure (reference `src/flag_gems/experimental_ops/abs.py`):
+```python
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _<kernel_name>_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(in_ptr + offsets, mask=mask)
+    y = ...  # elementwise computation
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+
+def <kernel_name>(x: torch.Tensor) -> torch.Tensor:
+    output = torch.empty_like(x)
+    n_elements = x.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    _<kernel_name>_kernel[grid](x, output, n_elements, BLOCK_SIZE=1024)
+    return output
+```
 
 #### 5b. Registration (limited)
 
-Use the Edit tool to make these changes:
+For experimental ops, do **NOT** modify `src/flag_gems/__init__.py` or `_FULL_CONFIG`.
+Optionally add an entry to `src/flag_gems/experimental_ops/__init__.py` if needed.
 
-1. **`src/flag_gems/ops/__init__.py`**: Add import and `__all__` entry:
-   ```python
-   from flag_gems.ops.<kernel_name>_v2 import <kernel_name>_v2
-   ```
-2. Do **NOT** add to `_FULL_CONFIG` in `src/flag_gems/__init__.py` — the variant must NOT
-   override the aten dispatch for the original operator.
+#### 5c. Standalone Test + Benchmark → `experimental_tests/<kernel_name>_test.py`
 
-#### 5c. Standalone Test + Benchmark → `experimental_tests/<kernel_name>_v2_test.py`
+Use the Write tool to create a single self-contained test file.
 
-Use the Write tool to create a single self-contained test file following the `experimental_tests/` pattern:
+**IMPORTANT — Match experimental_tests/ style**: Before writing the test, **read 1-2 existing
+test files** in `experimental_tests/` (e.g., `abs_test.py`, `sigmoid_test.py`). Match their exact style:
+- Direct import: `from flag_gems.experimental_ops.<kernel_name> import <kernel_name> as gems_<kernel_name>`
+- Reference call: `torch.ops.aten.<kernel_name>(ref_x)` (not `torch.<kernel_name>`)
+- `to_reference()` with `TO_CPU` support
+- `GenericBenchmark` from `benchmark.performance_utils` for perf tests
+- `triton.testing.do_bench` for inline benchmarks
 
+Follow this pattern (adapted from existing experimental tests):
 ```python
+# <KERNEL_NAME> operator test
+
 import os
 import sys
 
@@ -559,50 +678,85 @@ import pytest
 import torch
 
 import flag_gems
-from flag_gems.ops.<kernel_name>_v2 import <kernel_name>_v2 as gems_op
+from flag_gems.experimental_ops.<kernel_name> import <kernel_name> as gems_<kernel_name>
 
+# Add parent directory to path to import flag_gems
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 try:
-    from tests.accuracy_utils import gems_assert_close
+    from tests.accuracy_utils import TO_CPU, gems_assert_close  # noqa: E402
 except ImportError:
+    # Fallback values when running outside pytest
+    TO_CPU = False  # fallback
+
     def gems_assert_close(res, ref, dtype, **kwargs):
+        # Simple fallback comparison
         torch.testing.assert_close(res, ref, **kwargs)
 
-from benchmark.performance_utils import GenericBenchmark
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from benchmark.performance_utils import GenericBenchmark  # noqa: E402
 
 
 def to_reference(inp, upcast=False):
-    ref_inp = inp.to("cpu") if hasattr(inp, "to") else inp
+    if inp is None:
+        return None
+    if TO_CPU:
+        ref_inp = inp.to("cpu")
+    else:
+        ref_inp = inp.clone()
     if upcast:
-        ref_inp = ref_inp.to(torch.float64)
+        if ref_inp.is_complex():
+            ref_inp = ref_inp.to(torch.complex128)
+        else:
+            ref_inp = ref_inp.to(torch.float64)
     return ref_inp
 
 
-@pytest.mark.<kernel_name>_v2
-@pytest.mark.parametrize("shape", [(2, 3), (128, 256), (512, 512), (1024, 1024)])
+@pytest.mark.<kernel_name>
+@pytest.mark.parametrize("shape", [(2, 3), (128, 256), (512, 512)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_<kernel_name>_v2_accuracy(shape, dtype):
-    inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
-    ref_inp = to_reference(inp)
-    ref_out = <torch_call>(ref_inp)
-    act_out = gems_op(inp)
+def test_<kernel_name>_tensor(shape, dtype):
+    x = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    ref_x = to_reference(x)
+    ref_out = torch.ops.aten.<kernel_name>(ref_x)
+    with flag_gems.use_gems():
+        act_out = gems_<kernel_name>(x)
     gems_assert_close(act_out, ref_out, dtype=dtype)
 
 
-@pytest.mark.<kernel_name>_v2
-def test_<kernel_name>_v2_perf():
-    def input_fn(shape, dtype, device):
-        inp = torch.randn(shape, dtype=dtype, device=device)
+@pytest.mark.<kernel_name>
+def test_perf_aten_<kernel_name>():
+    def <kernel_name>_input_fn(shape, dtype, device):
+        inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
         yield inp,
 
     bench = GenericBenchmark(
-        input_fn=input_fn,
-        op_name="<kernel_name>_v2",
-        torch_op=<torch_call>,
+        input_fn=<kernel_name>_input_fn,
+        op_name="<kernel_name>",
+        torch_op=torch.ops.aten.<kernel_name>,
         dtypes=[torch.float32, torch.float16, torch.bfloat16],
     )
+
     return bench.run()
 ```
+
+---
+
+### Placement: Backend (`src/flag_gems/runtime/backend/_<vendor>/`)
+
+#### 5a. Operator Implementation
+
+Read existing operators in `src/flag_gems/runtime/backend/_<vendor>/ops/` to understand the
+exact patterns used by this vendor. Follow the same style.
+
+#### 5b. Registration
+
+Follow the vendor's existing registration pattern (check `__init__.py` in the vendor directory).
+
+#### 5c. Tests
+
+Follow the vendor's existing test patterns. Read existing test files in the vendor's test
+directory before writing new ones.
 
 ---
 
@@ -616,8 +770,9 @@ If the repo uses linting tools (ruff, black, isort, flake8), run them on the cha
 catch style issues early. Use the shell tool:
 
 ```bash
-python -m ruff check src/flag_gems/ops/<kernel_name>.py --fix
-python -m ruff format src/flag_gems/ops/<kernel_name>.py
+# Adjust path based on <placement>
+python -m ruff check <operator_file_path> --fix
+python -m ruff format <operator_file_path>
 ```
 
 If `ruff` is not installed, check for other formatters in `pyproject.toml` or `setup.cfg` and
@@ -626,19 +781,8 @@ use those. If no linter is configured, skip this step.
 ### 5.5b. Triton Compile Smoke Test
 
 Triton kernel compile errors only surface on first invocation (JIT compilation).
-This smoke test ensures JIT compilation happens before pytest runs, catching compile
-errors early with clear diagnostics rather than buried in test output:
 
-**For Path 1:**
-
-Adapt the smoke test call based on `func_type`:
-- **Unary**: `torch.<kernel_name>(inp)`
-- **Binary**: `torch.<kernel_name>(inp, inp)` (pass the same tensor twice)
-- **Reduction**: `torch.<kernel_name>(inp)` or `torch.<kernel_name>(inp, dim=-1)` if `dim` is required
-- **Normalization / other**: use `<torch_call>` with appropriate arguments
-
-Use `inspect.signature` to infer missing arguments (e.g., weight, bias, eps for layer_norm) before constructing the smoke test. This ensures all mandatory parameters are included with sensible defaults, avoiding runtime errors from incomplete function calls.
-
+**For Core placement:**
 ```bash
 python -c "
 import torch, flag_gems
@@ -646,20 +790,20 @@ for dtype in [torch.float32, torch.float16, torch.bfloat16]:
     for shape in [(1,), (4,), (128,), (4, 128), (0,)]:
         inp = torch.empty(shape, dtype=dtype, device=flag_gems.device) if shape == (0,) else torch.randn(shape, dtype=dtype, device=flag_gems.device)
         with flag_gems.use_gems():
-            out = <SMOKE_TEST_CALL>  # e.g. torch.relu(inp) or torch.add(inp, inp)
+            out = <SMOKE_TEST_CALL>  # e.g. torch.relu(inp)
         print(f'Smoke test passed: {dtype}, shape={shape}')
 "
 ```
 
-**For Path 2:**
+**For Experimental placement:**
 ```bash
 python -c "
 import torch, flag_gems
-from flag_gems.ops.<kernel_name>_v2 import <kernel_name>_v2
+from flag_gems.experimental_ops.<kernel_name> import <kernel_name>
 for dtype in [torch.float32, torch.float16, torch.bfloat16]:
     for shape in [(1,), (4,), (128,), (4, 128), (0,)]:
         inp = torch.empty(shape, dtype=dtype, device=flag_gems.device) if shape == (0,) else torch.randn(shape, dtype=dtype, device=flag_gems.device)
-        out = <kernel_name>_v2(inp)  # For binary: <kernel_name>_v2(inp, inp)
+        out = <kernel_name>(inp)
         print(f'Smoke test passed: {dtype}, shape={shape}')
 "
 ```
@@ -668,19 +812,86 @@ The `(0,)` shape tests the empty-tensor edge case (numel==0), which often causes
 
 If this fails, read the error and fix the kernel before proceeding to Step 6.
 
+### 5.5c. Chip Compatibility Check (before local testing)
+
+Before running local tests, verify that the local hardware matches the operator's
+`target_device` (determined in Step 1). Use the Bash tool:
+
+```bash
+python - <<'PY'
+import subprocess
+try:
+    import torch
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"nvidia: {torch.cuda.get_device_name(i)}")
+    else:
+        print("No CUDA device available")
+except Exception:
+    print("torch not available")
+try:
+    r = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=5)
+    if r.returncode == 0 and "NPU" in r.stdout:
+        print("huawei: Ascend NPU detected")
+except Exception:
+    pass
+try:
+    r = subprocess.run(["rocm-smi"], capture_output=True, text=True, timeout=5)
+    if r.returncode == 0:
+        kind = "haiguang" if "hygon" in r.stdout.lower() else "amd"
+        print(f"{kind}: ROCm device detected")
+except Exception:
+    pass
+PY
+```
+
+Compare detected hardware with `target_device`:
+
+| Target Device | Required Local Hardware |
+|---|---|
+| `nvidia` (default) | NVIDIA GPU |
+| `huawei` | Huawei Ascend NPU (`npu-smi`) |
+| `haiguang` | Hygon DCU (`rocm-smi` + Hygon) |
+| `moore` | Moore Threads GPU |
+| `tianshu` | Tianshu GPU |
+| `cambricon` | Cambricon MLU |
+
+**If the local hardware does NOT match the target device**, warn the user:
+
+```
+⚠️ Hardware mismatch detected:
+  - Operator target device: <target_device>
+  - Local hardware: <detected_hardware>
+
+Running tests for a <target_device> operator on <detected_hardware> hardware will likely
+fail or produce incorrect results. Please choose:
+
+  A — Skip local testing: Do not run local tests; rely on MCP test reports (if available).
+  B — Proceed anyway: Run local tests despite the mismatch (results may be unreliable).
+```
+
+If the user chooses A, skip Steps 6 and 7 and proceed to Step 8 (Summary).
+If the user chooses B, proceed with local tests but note the mismatch in the final report.
+
 ## Step 6: Run Accuracy Tests
 
 Run the accuracy tests for the newly added operator.
 Assume the current working directory is the repository root.
 
-**For Path 1 (new / replace):**
+**For Core placement:**
 ```bash
 python -m pytest tests/test_<category>_ops.py -m <kernel_name> -v
 ```
 
-**For Path 2 (custom variant):**
+**For Experimental placement:**
 ```bash
-python -m pytest experimental_tests/<kernel_name>_v2_test.py -v -k "accuracy"
+python -m pytest experimental_tests/<kernel_name>_test.py -v -k "test_<kernel_name>"
+```
+
+**For Backend placement:**
+```bash
+# Use the vendor's test running convention (read existing CI scripts or Makefile first)
+python -m pytest <backend_test_path> -m <kernel_name> -v
 ```
 
 Report the results to the user. If tests fail, follow the **error classification and retry
@@ -726,14 +937,6 @@ but add the error information to `flagos_wiki` as additional hints.
 **Increment**: `iteration_count += 1`.
 Keep `flagos_wiki` concise — maximum 10 items total. If retrying multiple times, replace
 earlier error entries rather than appending, to avoid bloating the prompt.
-```python
-flagos_wiki = [
-    # ... original flagos_wiki items from Step 3 ...
-    "Previous generation failed accuracy test: <brief error description>",
-    "Error was: <key line from traceback>",
-    "Fix hint: <your analysis, e.g. 'promotion method should be INT_TO_FLOAT not DEFAULT'>"
-]
-```
 Replace the kernel code with the new MCP output, re-run tests.
 - If tests **pass** → proceed to Step 7.
 - If tests **still fail** → proceed to Step 6c.
@@ -741,8 +944,7 @@ Replace the kernel code with the new MCP output, re-run tests.
 **Step 6c. MCP optimization — pass error context to optimize_triton:**
 Try `mcp__kernelgen-mcp__optimize_triton` with the current kernel code and the
 `check_result` parameter containing the error traceback.
-**Increment**: `iteration_count += 1`. This endpoint can fix
-memory access patterns, index calculations, and numerical issues.
+**Increment**: `iteration_count += 1`.
 Replace the kernel code with the optimized output, re-run tests.
 - If tests **pass** → proceed to Step 7.
 - If tests **still fail** → proceed to Step 6d.
@@ -757,29 +959,18 @@ Do not keep retrying. Report the failure to the user with:
 
 Run the performance benchmark.
 
-**For Path 1 (new / replace):**
+**For Core placement:**
 ```bash
 python -m pytest benchmark/test_<category>_perf.py -m <kernel_name> -v
 ```
 
-**For Path 2 (custom variant):**
+**For Experimental placement:**
 ```bash
-python -m pytest experimental_tests/<kernel_name>_v2_test.py -v -k "perf"
+python -m pytest experimental_tests/<kernel_name>_test.py -v -k "perf"
 ```
 
 Look for lines in the output containing keywords like `speedup`, `latency`, `gems`, `torch`, or
-timing values. Use regex patterns to extract numbers, accounting for various formats:
-- `(\d+(?:\.\d+)?)\s*(us|ms|s)` — number with space before unit
-- `(\d+(?:\.\d+)?)(ms|us|s)` — number directly attached to unit (e.g., `0.123ms`)
-- `(\d+(?:\.\d+)?)\s*(us|ms|s)/iter` — number with per-iteration suffix (e.g., `0.123 ms/iter`)
-- `time:\s*(\d+(?:\.\d+)?)` — labeled timing values
-- `(?i)avg:\s*(\d+(?:\.\d+)?)\s*(us|ms|s)` — average timing value (e.g., `avg: 0.123 ms`)
-- `(?i)mean:\s*(\d+(?:\.\d+)?)\s*(us|ms|s)` — mean timing value (pytest-benchmark format, e.g., `mean: 0.123 ms`)
-- `(?i)median:\s*(\d+(?:\.\d+)?)\s*(us|ms|s)` — median timing value
-- `(?i)Torch.*?(\d+(?:\.\d+)?)\s*(us|ms|s)` — PyTorch reference time (case-insensitive)
-- `(?i)GEMS.*?(\d+(?:\.\d+)?)\s*(us|ms|s)` — FlagGems kernel time (case-insensitive)
-- `(?i)(flag_gems|gems).*?(\d+(?:\.\d+)?)\s*(us|ms|s)` — FlagGems kernel time (alternate)
-- `(?i)(torch|pytorch).*?(\d+(?:\.\d+)?)\s*(us|ms|s)` — PyTorch time (case-insensitive)
+timing values. Use regex patterns to extract numbers.
 
 **Do not just copy the raw table** — always compute and report actual speedup ratios.
 
@@ -791,8 +982,7 @@ If benchmark results look unreasonably slow on the first config, check whether t
 framework includes a warmup phase. If not, the first data point may be an outlier — **if the
 first timing sample is >5x larger than the median of remaining samples, exclude it** from the
 average speedup calculation and note "first sample excluded (Triton JIT compile overhead)" in
-the report. Triton JIT compilation is detected when the first invocation is disproportionately
-slow — always ignore such outliers when computing average speedup.
+the report.
 
 ## Step 8: Summary
 
@@ -803,15 +993,20 @@ output:
 === KernelGen Operator Generation Report ===
 
 Operator Name: <kernel_name>
-Generation Mode: New / Replace Existing / Custom Variant (v2)
+Placement: Core / Experimental / Backend (_<vendor>)
+Generation Mode: New / Replace Existing / Experimental Variant
 Operator Type: <func_type>
+Target Device: <target_device>
 
 File Changes:
-  - [New/Modified] src/flag_gems/ops/<kernel_name>.py
-  - [Modified] src/flag_gems/ops/__init__.py
-  - [Modified] src/flag_gems/__init__.py
-  - [Modified] tests/test_<category>_ops.py
-  - [Modified] benchmark/test_<category>_perf.py
+  - [New/Modified] <operator_file_path>
+  - [New/Modified] <test_file_path>
+  - [Modified] <benchmark_file_path> (if applicable)
+  - [Modified] src/flag_gems/ops/__init__.py (if core)
+  - [Modified] src/flag_gems/__init__.py (if core)
+
+Decorator Style: pointwise_dynamic / raw triton.jit / other
+Test Style: use_gems() + torch.<op>() / direct import from experimental_ops
 
 Accuracy Tests: <N> passed, <M> failed (total <N+M> test cases)
   Pass Rate: <N/(N+M)*100>%
@@ -837,46 +1032,121 @@ Performance Analysis:
 Issues and Fixes: (if any)
 ```
 
-**How to extract the numbers:**
-- **Pass/fail counts**: Parse pytest output for the line matching `X passed` or `X passed, Y failed`.
-  Use regex pattern `(\d+) passed` and `(\d+) failed` to extract.
-- **Speedup**: Parse benchmark output for FlagGems vs PyTorch time values. Calculate
-  `speedup = torch_latency / gems_latency` for each config. Report min, max, and average.
-  - **Do not just copy the raw table** — always compute and report the actual speedup ratios.
-
 **After presenting the summary, check the speedup:**
 
-- **If average speedup < 0.5x** (kernel slower than PyTorch), proactively warn the user:
-  ```
-  ⚠️ The generated Triton kernel is slower than the PyTorch reference implementation.
-  This is typically caused by suboptimal memory access patterns or improper block size configuration.
-  Would you like to use /kernelgen_optimizer to optimize this kernel's performance?
-  ```
-
-- **If average speedup is 0.5x ~ 1.2x**, ask the user:
-  ```
-  Current speedup is low (<X.XX>x), there may be room for optimization.
-  Would you like to use /kernelgen_optimizer to try improving performance?
-  ```
-
+- **If average speedup < 0.5x** (kernel slower than PyTorch), proactively warn the user.
+- **If average speedup is 0.5x ~ 1.2x**, suggest optimization.
 - **If average speedup > 1.2x**, no action needed — report the result normally.
+
+## Step 9: Post-Completion Actions
+
+After the summary is presented (whether based on MCP reports or local test results), perform
+the following two checks.
+
+### 9a. Chat Tool Notification
+
+If the user's task was received via a chat tool (e.g., Feishu/飞书, Discord, Slack, Teams,
+DingTalk/钉钉, WeChat Work/企业微信, Telegram, or any similar messaging platform), or if
+the user mentions sending results to a client or team, ask:
+
+> The operator generation is complete. Would you like me to prepare a message to send the
+> generated files or summary to your client/team via **<chat_tool_name>**?
+
+If the user confirms:
+1. Prepare a concise summary message including: operator name, file paths, accuracy pass
+   rate, speedup metrics, and any issues.
+2. If the chat tool has a CLI or API integration available in the environment, use it to
+   send the message directly.
+3. If no CLI/API is available, format the message as copy-paste ready text for the user.
+4. If files need to be sent, list the exact file paths the user should attach.
+
+### 9b. Git Repository PR Submission
+
+Check whether the current project is managed by a git-based hosting service:
+
+```bash
+git remote -v 2>/dev/null | head -5
+```
+
+Detect the hosting platform from the remote URL:
+- `github.com` → GitHub
+- `gitlab.com` (or self-hosted GitLab) → GitLab
+- `gitee.com` → Gitee
+- `bitbucket.org` → Bitbucket
+
+**If a git hosting platform is detected**, ask the user:
+
+> This project is hosted on **<platform>**. Would you like me to automatically create a
+> Pull Request with the generated operator code?
+
+**If the user confirms**, follow the standard PR creation workflow:
+
+1. Create a new branch: `kernelgen/<kernel_name>`
+2. Stage all changed/new files related to this operator generation (never use `git add -A`)
+3. Create a commit with a descriptive message
+4. Push the branch to the remote with `-u` flag
+5. Create the PR using the platform's CLI tool:
+
+   **For GitHub** (`gh`):
+   ```bash
+   gh pr create --title "Add <kernel_name> operator via KernelGen" --body "$(cat <<'EOF'
+   ## Summary
+   Add `<kernel_name>` operator (<func_type>) generated via KernelGen MCP service.
+
+   ## Changes
+   - [New/Modified] `<kernel_file_path>` — Triton kernel implementation
+   - [New/Modified] `<test_file_path>` — Accuracy tests
+   - [New/Modified] `<benchmark_file_path>` — Performance benchmarks
+   - [Modified] `<registration_files>` — Operator registration (if applicable)
+
+   ## Test Results
+   ### Accuracy
+   - **Pass rate**: <N>/<total> (<percentage>%)
+   - **Failed cases**: <list or "None">
+
+   ### Performance
+   - **Avg speedup**: <X.XX>x vs PyTorch reference
+   - **Best**: <X.XX>x | **Worst**: <X.XX>x
+
+   ## Generation Details
+   - **MCP iterations**: <iteration_count>
+   - **Target device**: <target_device>
+   - **Operator type**: <func_type>
+   - **Placement**: <core / experimental / backend>
+
+   ---
+   Generated by KernelGen MCP skill
+
+   EOF
+   )"
+   ```
+
+   **For Gitee / GitLab**: Provide the PR/MR creation URL and prepared description.
+
+6. Return the PR URL to the user.
+
+**If PR creation fails**, report the error, provide the branch name, and suggest manual PR
+creation with the prepared description.
+
+**If the user declines**, do nothing — changes remain as local files.
 
 ## Important Notes
 
 - **`kernel_name` must match the `torch` API name** (e.g., `silu` not `swish`, `neg` not `negate`).
   The accuracy test calls `torch.<kernel_name>(...)`, so a mismatch will cause test failures.
 - **Never overwrite existing operators** without explicit user permission (Step 2 choice)
-- **Always use `pointwise_dynamic`** for core pointwise ops — do NOT write raw pointer-based Triton kernels
-  for core ops. Raw pointer style is only for custom variants (Option C / Path 2).
+- **Placement determines decorator style**:
+  - Core ops → `pointwise_dynamic` for pointwise, follow existing patterns for others
+  - Experimental ops → raw `@triton.jit` pointer-based style
+  - Backend ops → follow vendor-specific patterns
+- **Placement determines test style**:
+  - Core (`tests/`) → `flag_gems.use_gems()` + `torch.<op>()`
+  - Experimental (`experimental_tests/`) → direct `from flag_gems.experimental_ops.<op> import <op>`
+  - Backend → vendor-specific test patterns
+- **Default placement for new operators is experimental** — only use core if user explicitly requests it
 - **Follow alphabetical ordering** when adding entries to `__init__.py` and `__all__`
 - **Match the existing code style** exactly — read existing files first and copy the pattern
-  (imports, logging, naming conventions, registration format)
-- **Benchmark follow the existing pattern** in the file — do NOT invent new patterns for
-  `forward_operations` or `forward_inplace_operations`
-- If accuracy tests fail, try to fix the operator. If benchmark is slow, consider calling
-  `mcp__kernelgen-mcp__optimize_triton` to optimize the kernel
-- When creating a custom variant, always make it clear that it does NOT override the aten dispatch
-  to avoid conflicts with the existing operator
+  (imports, logging, naming conventions, registration format, test patterns)
 - **Speedup formula**: `speedup = torch_latency / gems_latency` (values > 1.0 mean gems is faster)
 - **Always use built-in tools** (shell, Read, Write, Edit, Grep, Glob) instead of
   outputting commands or code snippets for the user to execute manually

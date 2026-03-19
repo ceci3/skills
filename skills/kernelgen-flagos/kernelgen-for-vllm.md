@@ -1,28 +1,3 @@
----
-name: kernelgen-for-vllm
-description: >
-  Generate a vLLM operator/kernel via kernelgen-mcp. Checks environment & MCP availability, calls
-  the code generator, places files in the correct vLLM project locations, and runs accuracy +
-  benchmark tests. Use this skill when working in a vLLM repository and need to generate GPU kernel
-  operators. Trigger when the user says things like "generate a vLLM kernel", "create an operator
-  for vLLM", or "/kernelgen-for-vllm".
-argument-hint: "<operator_name> [--func-type <type>]"
-user-invokable: true
-compatibility: "Python 3.8+, vLLM, PyTorch with CUDA, Triton"
-metadata:
-  version: "1.0.0"
-  author: flagos-ai
-  category: gpu-kernel-generation
-  tags: [kernelgen, vllm, triton, gpu, mcp, operator-generation]
-allowed-tools:
-  - Bash
-  - Read
-  - Write
-  - Edit
-  - Glob
-  - Grep
-  - AskUserQuestion
----
 
 # KernelGen Skill — Generate vLLM Operators via MCP
 
@@ -49,6 +24,12 @@ Follow these rules strictly to avoid getting lost in the multi-step workflow:
 7. **Never fabricate repository files or paths**. If a required file cannot be found using the
    Glob or Grep tools, report it to the user instead of guessing. Do not assume a file exists
    at a path without verifying it first.
+8. **CRITICAL — MCP is mandatory**: ALL operator code generation MUST go through the
+   `mcp__kernelgen-mcp__generate_operator` MCP tool. NEVER generate Triton kernels, PyTorch
+   wrappers, or operator implementations yourself — even if the operator seems simple (e.g.,
+   relu, abs). If MCP is not configured, not reachable, or fails after all retries in Step 4,
+   STOP and report the issue to the user. Do NOT fall back to writing kernel code manually.
+   The MCP service produces optimized, tested code that manual writing cannot match.
 
 ## Step 0: Pre-flight — Environment & MCP Check
 
@@ -386,6 +367,42 @@ def ref_impl(x, weight, eps=1e-6):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
 ```
 This is needed so that accuracy tests have a reference to compare against.
+
+## Step 4.5: MCP Report Review
+
+If the MCP response includes test results (accuracy test reports, benchmark/speedup reports),
+present them to the user **in full** before proceeding to local code adaptation:
+
+```
+=== MCP Generation Test Report ===
+
+Accuracy Test Results:
+<paste the COMPLETE accuracy test output from the MCP response — do not summarize or truncate>
+
+Performance Benchmark Results:
+<paste the COMPLETE benchmark/speedup output from the MCP response — do not summarize or truncate>
+```
+
+Then ask the user:
+
+> The MCP service has returned the above test reports from its generation environment.
+> Would you like to:
+>
+> **A — Skip local testing**: Trust the MCP reports and proceed directly to code placement
+> and summary. No local tests will be run.
+>
+> **B — Run local tests**: Run accuracy and performance tests on your local machine as well
+> to verify the results in your specific environment.
+
+Wait for the user's choice before proceeding:
+- If **A (skip local testing)**: After placing code in Step 5, skip Steps 6 and 7 (local
+  accuracy tests and benchmarks) and proceed directly to Step 8 (Summary). Use the MCP
+  report numbers for the summary.
+- If **B (run local tests)**: Proceed normally through Steps 5 → 6 → 7 → 8. Before
+  running local tests, perform the **Chip Compatibility Check** described in Step 5.5.
+
+**If the MCP response does NOT include test reports** (only code blocks), proceed normally
+to Step 5 — local testing will be required.
 
 ## Step 5: Adapt and Place Code into the vLLM Project
 
@@ -780,6 +797,52 @@ as the torch baseline.
 
 ## Step 6: Run Accuracy Tests
 
+### Step 5.5: Chip Compatibility Check (before local testing)
+
+Before running any local tests, verify that the local hardware matches the target device.
+vLLM operators typically target NVIDIA GPUs, but verify this explicitly:
+
+```bash
+python - <<'PY'
+import subprocess
+try:
+    import torch
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"nvidia: {torch.cuda.get_device_name(i)}")
+    else:
+        print("No CUDA device available")
+except Exception:
+    print("torch not available")
+try:
+    r = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=5)
+    if r.returncode == 0 and "NPU" in r.stdout:
+        print("huawei: Ascend NPU detected")
+except Exception:
+    pass
+PY
+```
+
+**If the detected hardware does NOT match the operator's target device** (e.g., operator
+targets `huawei` but local machine has NVIDIA GPU, or vice versa), warn the user:
+
+```
+⚠️ Hardware mismatch detected:
+  - Operator target device: <target_device>
+  - Local hardware: <detected_hardware>
+
+Running tests for a <target_device> operator on <detected_hardware> hardware will likely
+fail or produce incorrect results. Please choose:
+
+  A — Skip local testing: Do not run local tests; rely on MCP test reports (if available).
+  B — Proceed anyway: Run local tests despite the mismatch (results may be unreliable).
+```
+
+If the user chooses A, skip Steps 6 and 7 and proceed to Step 8 (Summary).
+If the user chooses B, proceed with local tests but note the mismatch in the final report.
+
+---
+
 Use the Bash tool to run the accuracy tests for the newly added operator.
 
 First, verify the working directory is the vLLM repo root:
@@ -984,6 +1047,97 @@ Issues and Fixes: (if any)
     - `(?i)Triton.*?(\d+(?:\.\d+)?)\s*(us|ms|s)` — Triton kernel time
     - `(?i)(torch|pytorch).*?(\d+(?:\.\d+)?)\s*(us|ms|s)` — PyTorch reference time
   - **Do not just copy the raw table** — always compute and report the actual speedup ratios.
+
+## Step 9: Post-Completion Actions
+
+After the summary is presented (whether based on MCP reports or local test results), perform
+the following two checks.
+
+### 9a. Chat Tool Notification
+
+If the user's task was received via a chat tool (e.g., Feishu/飞书, Discord, Slack, Teams,
+DingTalk/钉钉, WeChat Work/企业微信, Telegram, or any similar messaging platform), or if
+the user mentions sending results to a client or team, ask:
+
+> The operator generation is complete. Would you like me to prepare a message to send the
+> generated files or summary to your client/team via **<chat_tool_name>**?
+
+If the user confirms:
+1. Prepare a concise summary message including: operator name, file paths, accuracy pass
+   rate, speedup metrics, and any issues.
+2. If the chat tool has a CLI or API integration available in the environment, use it to
+   send the message directly.
+3. If no CLI/API is available, format the message as copy-paste ready text for the user.
+4. If files need to be sent, list the exact file paths the user should attach.
+
+### 9b. Git Repository PR Submission
+
+Check whether the current project is managed by a git-based hosting service:
+
+```bash
+git remote -v 2>/dev/null | head -5
+```
+
+Detect the hosting platform from the remote URL:
+- `github.com` → GitHub
+- `gitlab.com` (or self-hosted GitLab) → GitLab
+- `gitee.com` → Gitee
+- `bitbucket.org` → Bitbucket
+
+**If a git hosting platform is detected**, ask the user:
+
+> This project is hosted on **<platform>**. Would you like me to automatically create a
+> Pull Request with the generated operator code?
+
+**If the user confirms**, follow the standard PR creation workflow:
+
+1. Create a new branch: `kernelgen/<kernel_name>`
+2. Stage all changed/new files related to this operator generation (never use `git add -A`)
+3. Create a commit with a descriptive message
+4. Push the branch to the remote with `-u` flag
+5. Create the PR using the platform's CLI tool:
+
+   **For GitHub** (`gh`):
+   ```bash
+   gh pr create --title "Add <kernel_name> operator via KernelGen" --body "$(cat <<'EOF'
+   ## Summary
+   Add `<kernel_name>` operator (<func_type>) generated via KernelGen MCP service.
+
+   ## Changes
+   - [New/Modified] `<kernel_file_path>` — Triton kernel implementation
+   - [New/Modified] `<test_file_path>` — Accuracy tests
+   - [New/Modified] `<benchmark_file_path>` — Performance benchmarks
+   - [Modified] `<registration_files>` — Operator registration (if applicable)
+
+   ## Test Results
+   ### Accuracy
+   - **Pass rate**: <N>/<total> (<percentage>%)
+   - **Failed cases**: <list or "None">
+
+   ### Performance
+   - **Avg speedup**: <X.XX>x vs PyTorch reference
+   - **Best**: <X.XX>x | **Worst**: <X.XX>x
+
+   ## Generation Details
+   - **MCP iterations**: <count>
+   - **Target device**: <device>
+   - **Operator type**: <func_type>
+
+   ---
+   Generated by KernelGen MCP skill
+
+   EOF
+   )"
+   ```
+
+   **For Gitee / GitLab**: Provide the PR/MR creation URL and prepared description.
+
+6. Return the PR URL to the user.
+
+**If PR creation fails**, report the error, provide the branch name, and suggest manual PR
+creation with the prepared description.
+
+**If the user declines**, do nothing — changes remain as local files.
 
 ## Important Notes
 

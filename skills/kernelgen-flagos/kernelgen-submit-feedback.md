@@ -1,31 +1,3 @@
----
-name: kernelgen-submit-feedback
-description: >
-  Submit a GitHub issue to the flagos-ai/skills repository when a user reports a bug, defect, or
-  improvement related to a skill. Use when the user explicitly says a skill is broken or not working,
-  reports a bug or defect, asks to file a GitHub issue about a skill, or wants to submit feedback.
-  Do NOT trigger for general questions about skills or unrelated bug reports. If the user does not
-  want to use GitHub, offer the option to send feedback via email to contact@flagos.io.
-argument-hint: "[skill-name] (optional if inferable)"
-user-invokable: true
-compatibility: "GitHub CLI (gh) for issue submission, or email client for email fallback"
-metadata:
-  version: "1.0.0"
-  author: flagos-ai
-  category: feedback
-  tags: [feedback, github-issues, bug-report, skill-support]
-allowed-tools:
-  - Bash(gh:*)
-  - Bash(python:*)
-  - Bash(python3:*)
-  - Bash(command:*)
-  - Read
-  - Edit
-  - Write
-  - Glob
-  - Grep
-  - AskUserQuestion
----
 
 # Submit Feedback Skill
 
