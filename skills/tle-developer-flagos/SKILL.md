@@ -1,5 +1,5 @@
 ---
-name: tle-developer
+name: tle-developer-flagos
 description: >
   Self-contained orchestration skill for writing high-performance TLE kernels
   and shipping TLE feature changes with reproducible validation. Use when the
