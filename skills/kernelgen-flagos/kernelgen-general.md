@@ -1,30 +1,3 @@
----
-name: kernelgen
-description: >
-  Generate GPU kernel operators via kernelgen-mcp and integrate them into the current repository.
-  Checks environment & MCP availability, discovers repo structure, calls the code generator,
-  places files in the correct project locations following local conventions, and runs accuracy
-  + benchmark tests. Works with any Python/Triton project. Use this skill when the user wants
-  to generate a GPU kernel operator, create a Triton kernel, or says things like "generate an
-  operator", "create a kernel for X", or "/kernelgen". Do NOT trigger for FlagGems-specific
-  or vLLM-specific requests — use the specialized skills instead.
-argument-hint: "<operator_name> [--func-type <type>]"
-user-invokable: true
-compatibility: "Python 3.8+, PyTorch with CUDA, Triton"
-metadata:
-  version: "1.0.0"
-  author: flagos-ai
-  category: gpu-kernel-generation
-  tags: [kernelgen, triton, gpu, mcp, operator-generation]
-allowed-tools:
-  - Bash
-  - Read
-  - Write
-  - Edit
-  - Glob
-  - Grep
-  - AskUserQuestion
----
 
 # KernelGen Skill — Generate GPU Operators via MCP (General Purpose)
 
@@ -67,6 +40,12 @@ Follow these rules strictly to avoid getting lost in the multi-step workflow:
    discovered in Step 2. Never run Grep on `.` or the repo root — always scope searches to
    the specific discovered source, test, or benchmark directories. Unscoped searches cause
    token explosion and match vendored code, docs, and build artifacts.
+10. **CRITICAL — MCP is mandatory**: ALL operator code generation MUST go through the
+    `mcp__kernelgen-mcp__generate_operator` MCP tool. NEVER generate Triton kernels, PyTorch
+    wrappers, or operator implementations yourself — even if the operator seems simple (e.g.,
+    relu, abs). If MCP is not configured, not reachable, or fails after all retries in Step 5,
+    STOP and report the issue to the user. Do NOT fall back to writing kernel code manually.
+    The MCP service produces optimized, tested code that manual writing cannot match.
 
 ---
 
@@ -514,6 +493,44 @@ If the MCP call fails, apply retries in this order:
 
 ---
 
+## Step 5.5: MCP Report Review
+
+If the MCP response includes test results (accuracy test reports, benchmark/speedup reports),
+present them to the user **in full** before proceeding to local code adaptation:
+
+```
+=== MCP Generation Test Report ===
+
+Accuracy Test Results:
+<paste the COMPLETE accuracy test output from the MCP response — do not summarize or truncate>
+
+Performance Benchmark Results:
+<paste the COMPLETE benchmark/speedup output from the MCP response — do not summarize or truncate>
+```
+
+Then ask the user:
+
+> The MCP service has returned the above test reports from its generation environment.
+> Would you like to:
+>
+> **A — Skip local testing**: Trust the MCP reports and proceed directly to code placement
+> and summary. No local tests will be run.
+>
+> **B — Run local tests**: Run accuracy and performance tests on your local machine as well
+> to verify the results in your specific environment.
+
+Wait for the user's choice before proceeding:
+- If **A (skip local testing)**: After placing code in Step 6, skip Steps 7 and 8 (local
+  accuracy tests and benchmarks) and proceed directly to Step 9 (Summary). Use the MCP
+  report numbers for the summary.
+- If **B (run local tests)**: Proceed normally through Steps 6 → 7 → 8 → 9. Before
+  running local tests, perform the **Chip Compatibility Check** described in Step 6.5d.
+
+**If the MCP response does NOT include test reports** (only code blocks), proceed normally
+to Step 6 — local testing will be required.
+
+---
+
 ## Step 6: Adapt and Place Code into the Repository
 
 This is the most critical step. The generated code must be **transformed to match the local
@@ -742,6 +759,80 @@ expected shapes for the `func_type`. Use `inspect.signature` to infer any missin
 all required parameters are covered. If the smoke test fails, read the error and fix the
 kernel before proceeding.
 
+### 6.5d. Chip Compatibility Check (before local testing)
+
+Before running any local tests, verify that the local hardware matches the target device
+specified for the operator. Use the Bash tool to detect local hardware:
+
+```bash
+python - <<'PY'
+import subprocess, sys
+
+def detect():
+    chips = []
+    # NVIDIA GPU
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                chips.append(("nvidia", torch.cuda.get_device_name(i)))
+    except Exception:
+        pass
+    # Huawei Ascend NPU
+    try:
+        r = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and "NPU" in r.stdout:
+            chips.append(("huawei", "Ascend NPU"))
+    except Exception:
+        pass
+    # AMD / Hygon DCU
+    try:
+        r = subprocess.run(["rocm-smi"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            chips.append(("haiguang" if "hygon" in r.stdout.lower() else "amd", "ROCm device"))
+    except Exception:
+        pass
+    if not chips:
+        chips.append(("unknown", "No accelerator detected"))
+    for kind, name in chips:
+        print(f"  {kind}: {name}")
+    return chips
+
+print("Local hardware:")
+detect()
+PY
+```
+
+Compare the detected hardware with the operator's `target_device` (determined in Step 1 or
+inferred from user context — default is `nvidia`):
+
+| Target Device | Required Local Hardware |
+|---|---|
+| `nvidia` | NVIDIA GPU (detected via `torch.cuda`) |
+| `huawei` | Huawei Ascend NPU (detected via `npu-smi`) |
+| `haiguang` | Hygon DCU (detected via `rocm-smi` with Hygon identifier) |
+| `moore` | Moore Threads GPU |
+| `tianshu` | Tianshu GPU |
+
+**If the local hardware does NOT match the target device**, warn the user:
+
+```
+⚠️ Hardware mismatch detected:
+  - Operator target device: <target_device>
+  - Local hardware: <detected_hardware>
+
+Running tests for a <target_device> operator on <detected_hardware> hardware will likely
+fail or produce incorrect results. Please choose:
+
+  A — Skip local testing: Do not run local tests; rely on MCP test reports (if available).
+  B — Proceed anyway: Run local tests despite the mismatch (results may be unreliable).
+```
+
+If the user chooses A, skip Steps 7 and 8 and proceed to Step 9 (Summary).
+If the user chooses B, proceed with local tests but note the mismatch in the final report.
+
+**If the hardware matches**, proceed normally.
+
 ---
 
 ## Step 7: Run Accuracy Tests
@@ -941,6 +1032,143 @@ Issues and Fixes: (if any)
   ```
 
 - **If average speedup > 1.2x**, no action needed — report the result normally.
+
+---
+
+## Step 10: Post-Completion Actions
+
+After the summary is presented (whether based on MCP reports or local test results), perform
+the following two checks.
+
+### 10a. Chat Tool Notification
+
+If the user's task was received via a chat tool (e.g., Feishu/飞书, Discord, Slack, Teams,
+DingTalk/钉钉, WeChat Work/企业微信, Telegram, or any similar messaging platform), or if
+the user mentions sending results to a client or team, ask:
+
+> The operator generation is complete. Would you like me to prepare a message to send the
+> generated files or summary to your client/team via **<chat_tool_name>**?
+
+If the user confirms:
+1. Prepare a concise summary message including: operator name, file paths, accuracy pass
+   rate, speedup metrics, and any issues.
+2. If the chat tool has a CLI or API integration available in the environment (e.g., `lark`
+   CLI for Feishu, `discord` webhook, `slack` CLI), use it to send the message directly.
+3. If no CLI/API is available, format the message as copy-paste ready text for the user.
+4. If files need to be sent, list the exact file paths the user should attach.
+
+### 10b. Git Repository PR Submission
+
+Check whether the current project is managed by a git-based hosting service:
+
+```bash
+git remote -v 2>/dev/null | head -5
+```
+
+Detect the hosting platform from the remote URL:
+- `github.com` → GitHub
+- `gitlab.com` (or self-hosted GitLab) → GitLab
+- `gitee.com` → Gitee
+- `bitbucket.org` → Bitbucket
+- Other git hosting → Generic git platform
+
+**If a git hosting platform is detected**, ask the user:
+
+> This project is hosted on **<platform>**. Would you like me to automatically create a
+> Pull Request with the generated operator code?
+
+**If the user confirms**, follow the standard PR creation workflow:
+
+1. **Create a new branch**:
+   ```bash
+   git checkout -b kernelgen/<kernel_name>
+   ```
+   (Use `kernelgen/<kernel_name>-v2` for custom variants.)
+
+2. **Stage all changed/new files** related to this operator generation:
+   ```bash
+   git add <kernel_file> <test_file> <benchmark_file> <registration_files...>
+   ```
+   Only stage files that were created or modified by this skill. Never use `git add -A`.
+
+3. **Create a commit** with a descriptive message:
+   ```bash
+   git commit -m "$(cat <<'EOF'
+   Add <kernel_name> operator via KernelGen
+
+   Generated <kernel_name> (<func_type>) operator using KernelGen MCP service.
+   Includes Triton kernel implementation, accuracy tests, and performance benchmarks.
+
+   EOF
+   )"
+   ```
+
+4. **Push the branch** to the remote:
+   ```bash
+   git push -u origin kernelgen/<kernel_name>
+   ```
+
+5. **Create the PR** using the platform's CLI tool:
+
+   **For GitHub** (`gh`):
+   ```bash
+   gh pr create --title "Add <kernel_name> operator via KernelGen" --body "$(cat <<'EOF'
+   ## Summary
+   Add `<kernel_name>` operator (<func_type>) generated via KernelGen MCP service.
+
+   ## Changes
+   - [New/Modified] `<kernel_file_path>` — Triton kernel implementation
+   - [New/Modified] `<test_file_path>` — Accuracy tests
+   - [New/Modified] `<benchmark_file_path>` — Performance benchmarks
+   - [Modified] `<registration_files>` — Operator registration (if applicable)
+
+   ## Test Results
+
+   ### Accuracy
+   - **Pass rate**: <N>/<total> (<percentage>%)
+   - **Failed cases**: <list or "None">
+
+   ### Performance
+   - **Avg speedup**: <X.XX>x vs PyTorch reference
+   - **Best**: <X.XX>x | **Worst**: <X.XX>x
+
+   ## Generation Details
+   - **MCP iterations**: <count>
+   - **Target device**: <device>
+   - **Operator type**: <func_type>
+
+   ---
+   Generated by KernelGen MCP skill
+
+   EOF
+   )"
+   ```
+
+   **For Gitee** (no standard CLI — provide URL):
+   ```
+   Please create a PR manually at:
+   https://gitee.com/<owner>/<repo>/pull/new/<branch_name>
+
+   I have prepared the PR description above — you can copy-paste it.
+   ```
+
+   **For GitLab** (`glab` if available, otherwise provide URL):
+   ```bash
+   glab mr create --title "Add <kernel_name> operator via KernelGen" --description "..."
+   ```
+
+6. **Return the PR URL** to the user:
+   ```
+   ✅ Pull Request created: <PR_URL>
+   ```
+
+**If PR creation fails** (no CLI tool, no permissions, authentication issues, etc.):
+- Report the error to the user
+- Provide the branch name: `kernelgen/<kernel_name>`
+- Suggest they create the PR manually with the prepared description
+
+**If the user declines the PR**, do nothing — the changes remain as local uncommitted files
+(or on the current branch if already committed).
 
 ---
 
