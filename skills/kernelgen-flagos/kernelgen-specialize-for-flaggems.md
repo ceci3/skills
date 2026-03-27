@@ -12,7 +12,7 @@ This skill combines the MCP auto-specialization tool (`specialize_kernel`) with 
 ## Usage
 
 ```bash
-/ascend-triton-migration-mcp-flagGems <source_file_path_or_op_name> [integration_mode] [output_directory]
+/kernelgen-specialize-for-flaggems <source_file_path_or_op_name> [integration_mode] [output_directory]
 ```
 
 **Parameters**:
@@ -27,13 +27,13 @@ This skill combines the MCP auto-specialization tool (`specialize_kernel`) with 
 **Examples**:
 ```bash
 # Default mode (vendor-ops)
-/ascend-triton-migration-mcp-flagGems /home/test/gelu_kernel.py
+/kernelgen-specialize-for-flaggems /home/test/gelu_kernel.py
 
 # Specify integration mode
-/ascend-triton-migration-mcp-flagGems /home/test/softmax.py vendor-fused
+/kernelgen-specialize-for-flaggems /home/test/softmax.py vendor-fused
 
 # Specify output directory
-/ascend-triton-migration-mcp-flagGems /home/test/layernorm.py experimental /home/MyFlagGems
+/kernelgen-specialize-for-flaggems /home/test/layernorm.py experimental /home/MyFlagGems
 ```
 
 ---
@@ -544,7 +544,7 @@ x = gelu_add_relu_fused(x, y)
 
 **Input**:
 ```bash
-/ascend-triton-migration-mcp-flagGems /home/test/gelu_cuda.py vendor-ops
+/kernelgen-specialize-for-flaggems /home/test/gelu_cuda.py vendor-ops
 ```
 
 **Automated workflow**:
@@ -574,7 +574,7 @@ Detailed report: /home/FlagGems/FLAGGEMS_INTEGRATION_REPORT.md
 
 **Input**:
 ```bash
-/ascend-triton-migration-mcp-flagGems /home/test/softmax_cuda.py override-builtin
+/kernelgen-specialize-for-flaggems /home/test/softmax_cuda.py override-builtin
 ```
 
 **Notes**:
@@ -586,7 +586,7 @@ Detailed report: /home/FlagGems/FLAGGEMS_INTEGRATION_REPORT.md
 
 **Input**:
 ```bash
-/ascend-triton-migration-mcp-flagGems /home/test/gelu_add_cuda.py vendor-fused
+/kernelgen-specialize-for-flaggems /home/test/gelu_add_cuda.py vendor-fused
 ```
 
 **Output files**:
@@ -597,18 +597,18 @@ Detailed report: /home/FlagGems/FLAGGEMS_INTEGRATION_REPORT.md
 
 ## Relationship with Other Skills
 
-### vs. ascend-triton-migration-SKILL-mcp
+### vs. kernelgen-specialize
 - **Similarities**: Both use MCP tool for auto-specialization
 - **Differences**: This skill additionally integrates into the FlagGems framework
 
-### vs. ascend-triton-migration-flagGems
+### vs. kernelgen-specialize
 - **Similarities**: Both integrate into the FlagGems framework
 - **Differences**: This skill uses MCP auto-specialization, no manual code modification needed
 
 ### Recommended Use Cases
 - **This skill**: Rapid migration + auto-integration, suitable for most scenarios
-- **ascend-triton-migration-SKILL-mcp**: Only need specialized code, no FlagGems integration needed
-- **ascend-triton-migration-flagGems**: Need manual control over code details
+- **kernelgen-specialize**: Only need specialized code, no FlagGems integration needed
+- **kernelgen-specialize**: Need manual control over code details
 
 ---
 
@@ -715,5 +715,5 @@ print(prof.key_averages().table(sort_by="npu_time_total"))
 - [FlagGems Official Documentation](https://github.com/FlagOpen/FlagGems)
 - [Ascend Triton Development Guide](https://www.hiascend.com/document)
 - [MCP Tool Usage Instructions](internal documentation)
-- [ascend-triton-migration-SKILL-mcp Skill](/.claude/commands/ascend-triton-migration-mcp.md)
-- [ascend-triton-migration-flagGems Skill](/.claude/commands/ascend-triton-migration-flagGems.md)
+- [kernelgen-specialize Skill](kernelgen-specialize.md)
+- [kernelgen-specialize-for-flaggems Skill](kernelgen-specialize-for-flaggems.md)
